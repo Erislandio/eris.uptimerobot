@@ -1,13 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createServerClient } from '@supabase/ssr'
+import { createClient } from '@supabase/supabase-js'
 import { Monitor } from '@/lib/types'
-import { cookies } from 'next/headers'
 
-// This cron endpoint should be called every minute by Vercel Cron
-// vercel.json: { "crons": [{ "path": "/api/cron", "schedule": "* * * * *" }] }
-// Secure it with a secret header: CRON_SECRET env var
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+/** Creates a Supabase client with service role key (bypasses RLS).
+ *  Falls back to anon key when service role key is not set. */
+function getAdminClient() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+  if (!url || !key) throw new Error('Missing Supabase environment variables')
+
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  })
+}
 
 async function executeRequest(monitor: Monitor) {
   const start = Date.now()
@@ -21,7 +31,8 @@ async function executeRequest(monitor: Monitor) {
       signal: controller.signal,
     }
 
-    if (monitor.body && monitor.method !== 'GET') {
+    // HEAD and GET have no body
+    if (monitor.body && monitor.method !== 'GET' && monitor.method !== 'HEAD') {
       options.body = monitor.body
     }
 
@@ -40,88 +51,107 @@ async function executeRequest(monitor: Monitor) {
       success: false,
       status_code: null,
       response_time_ms: Date.now() - start,
-      error_message: msg.includes('abort') ? 'Request timed out' : msg,
+      error_message: msg.toLowerCase().includes('abort') ? 'Request timed out' : msg,
     }
   }
 }
 
-export async function GET(req: NextRequest) {
-  // Verify cron secret
-  const secret = req.headers.get('x-cron-secret')
-  const expectedSecret = process.env.CRON_SECRET
-  if (expectedSecret && secret !== expectedSecret) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+async function runMonitor(supabase: ReturnType<typeof getAdminClient>, monitor: Monitor) {
+  let result = await executeRequest(monitor)
+
+  // Exponential back-off retry
+  if (!result.success && monitor.retry_count > 0) {
+    for (let i = 1; i <= monitor.retry_count; i++) {
+      await sleep(Math.min(1000 * Math.pow(2, i - 1), 8000))
+      const retry = await executeRequest(monitor)
+      if (retry.success) { result = retry; break }
+      if (i === monitor.retry_count) result = retry
+    }
   }
 
-  // Create Supabase admin-style client (service-role for cron)
-  const cookieStore = await cookies()
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll: () => cookieStore.getAll(),
-        setAll: () => {},
-      },
+  const triggerTime = new Date()
+  const nextTrigger = new Date(triggerTime.getTime() + monitor.interval_seconds * 1000)
+
+  // Persist log
+  const { error: logError } = await supabase.from('monitor_logs').insert({
+    monitor_id: monitor.id,
+    success: result.success,
+    status_code: result.status_code,
+    response_time_ms: result.response_time_ms,
+    error_message: result.error_message,
+    triggered_at: triggerTime.toISOString(),
+  })
+
+  if (logError) console.error(`[cron] log insert error (${monitor.id}):`, logError.message)
+
+  // Update monitor timestamps & status
+  const { error: updateError } = await supabase.from('monitors').update({
+    last_triggered_at: triggerTime.toISOString(),
+    next_trigger_at: nextTrigger.toISOString(),
+    status: result.success ? 'active' : 'error',
+    updated_at: triggerTime.toISOString(),
+  }).eq('id', monitor.id)
+
+  if (updateError) console.error(`[cron] monitor update error (${monitor.id}):`, updateError.message)
+
+  return { id: monitor.id, name: monitor.name, ...result }
+}
+
+// ─── GET /api/cron ─────────────────────────────────────────────────────────────
+// Called every minute by Vercel Cron (vercel.json) or by the dev-scheduler script.
+
+export async function GET(req: NextRequest) {
+  // Optional secret-based auth (set CRON_SECRET in env)
+  const expectedSecret = process.env.CRON_SECRET
+  if (expectedSecret) {
+    const provided = req.headers.get('x-cron-secret')
+      ?? req.nextUrl.searchParams.get('secret')
+    if (provided !== expectedSecret) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
     }
-  )
+  }
+
+  let supabase: ReturnType<typeof getAdminClient>
+  try {
+    supabase = getAdminClient()
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
 
   const now = new Date()
+  console.log(`[cron] tick at ${now.toISOString()}`)
 
-  // Find all active monitors that are due to run
-  const { data: dueMonitors, error } = await supabase
+  // Fetch all active monitors that are due
+  const { data: dueMonitors, error: fetchError } = await supabase
     .from('monitors')
     .select('*')
     .eq('status', 'active')
     .or(`next_trigger_at.is.null,next_trigger_at.lte.${now.toISOString()}`)
 
-  if (error) {
-    console.error('Cron fetch error:', error)
-    return NextResponse.json({ error: error.message }, { status: 500 })
+  if (fetchError) {
+    console.error('[cron] fetch error:', fetchError.message)
+    return NextResponse.json({ error: fetchError.message }, { status: 500 })
   }
 
   if (!dueMonitors || dueMonitors.length === 0) {
+    console.log('[cron] nothing to trigger')
     return NextResponse.json({ ran: 0, message: 'Nothing to trigger' })
   }
 
-  // Run all due monitors concurrently
-  const results = await Promise.allSettled(
-    (dueMonitors as Monitor[]).map(async (monitor) => {
-      let result = await executeRequest(monitor)
+  console.log(`[cron] ${dueMonitors.length} monitor(s) due — running concurrently`)
 
-      // Retry
-      if (!result.success && monitor.retry_count > 0) {
-        for (let i = 1; i <= monitor.retry_count; i++) {
-          await sleep(Math.min(1000 * Math.pow(2, i - 1), 8000))
-          const retry = await executeRequest(monitor)
-          if (retry.success) { result = retry; break }
-          if (i === monitor.retry_count) result = retry
-        }
-      }
-
-      const triggerTime = new Date()
-      const nextTrigger = new Date(triggerTime.getTime() + monitor.interval_seconds * 1000)
-
-      await supabase.from('monitor_logs').insert({
-        monitor_id: monitor.id,
-        success: result.success,
-        status_code: result.status_code,
-        response_time_ms: result.response_time_ms,
-        error_message: result.error_message,
-        triggered_at: triggerTime.toISOString(),
-      })
-
-      await supabase.from('monitors').update({
-        last_triggered_at: triggerTime.toISOString(),
-        next_trigger_at: nextTrigger.toISOString(),
-        status: result.success ? 'active' : 'error',
-        updated_at: triggerTime.toISOString(),
-      }).eq('id', monitor.id)
-
-      return { id: monitor.id, name: monitor.name, ...result }
-    })
+  // Run all due monitors in parallel
+  const settled = await Promise.allSettled(
+    (dueMonitors as Monitor[]).map(m => runMonitor(supabase, m))
   )
 
-  const summary = results.map(r => r.status === 'fulfilled' ? r.value : { error: (r as PromiseRejectedResult).reason })
-  return NextResponse.json({ ran: dueMonitors.length, results: summary })
+  const results = settled.map(r =>
+    r.status === 'fulfilled'
+      ? r.value
+      : { error: String((r as PromiseRejectedResult).reason) }
+  )
+
+  console.log(`[cron] done — ${results.filter(r => !('error' in r)).length} succeeded`)
+  return NextResponse.json({ ran: dueMonitors.length, results })
 }

@@ -1,5 +1,5 @@
 export type MonitorStatus = 'active' | 'paused' | 'error'
-export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 export interface Monitor {
   id: string

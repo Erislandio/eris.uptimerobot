@@ -11,7 +11,7 @@ interface MonitorModalProps {
   onSaved: () => void
 }
 
-const METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
+const METHODS: HttpMethod[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE']
 
 const INTERVALS = [
   { label: '1 minute', value: 60 },
@@ -277,7 +277,7 @@ export default function MonitorModal({ monitor, onClose, onSaved }: MonitorModal
                 </div>
 
                 {/* Body */}
-                {method !== 'GET' && (
+                {method !== 'GET' && method !== 'HEAD' && (
                   <div className="form-group">
                     <label className="form-label" htmlFor="monitor-body">Request Body (JSON)</label>
                     <textarea

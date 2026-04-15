@@ -10,6 +10,8 @@ import {
 } from 'lucide-react'
 import { formatDistanceToNow, format } from 'date-fns'
 
+const POLL_INTERVAL = 15_000 // 15 segundos
+
 function formatInterval(seconds: number) {
   if (seconds < 60) return `${seconds}s`
   if (seconds < 3600) return `${seconds / 60}m`
@@ -24,10 +26,12 @@ export default function MonitorsPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [togglingId, setTogglingId] = useState<string | null>(null)
   const [triggeringId, setTriggeringId] = useState<string | null>(null)
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
 
   const supabase = createClient()
 
-  const fetchMonitors = useCallback(async () => {
+  const fetchMonitors = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return
     const { data } = await supabase
@@ -36,11 +40,19 @@ export default function MonitorsPage() {
       .eq('user_id', user.id)
       .order('created_at', { ascending: false })
     setMonitors(data ?? [])
-    setLoading(false)
+    setLastRefreshed(new Date())
+    if (!silent) setLoading(false)
   }, [supabase])
 
+  // Initial load
   useEffect(() => {
     fetchMonitors()
+  }, [fetchMonitors])
+
+  // Auto-poll every 15 seconds
+  useEffect(() => {
+    const id = setInterval(() => fetchMonitors(true), POLL_INTERVAL)
+    return () => clearInterval(id)
   }, [fetchMonitors])
 
   async function handleDelete(id: string) {
@@ -54,23 +66,36 @@ export default function MonitorsPage() {
   async function handleToggle(monitor: Monitor) {
     setTogglingId(monitor.id)
     const newStatus = monitor.status === 'paused' ? 'active' : 'paused'
-    await supabase.from('monitors').update({ status: newStatus }).eq('id', monitor.id)
-    setMonitors(prev => prev.map(m => m.id === monitor.id ? { ...m, status: newStatus } : m))
+    const { error } = await supabase
+      .from('monitors')
+      .update({
+        status: newStatus,
+        // When resuming, schedule next trigger immediately
+        next_trigger_at: newStatus === 'active'
+          ? new Date(Date.now() + monitor.interval_seconds * 1000).toISOString()
+          : null,
+      })
+      .eq('id', monitor.id)
+    if (!error) {
+      setMonitors(prev => prev.map(m => m.id === monitor.id ? { ...m, status: newStatus } : m))
+    }
     setTogglingId(null)
   }
 
   async function handleTriggerNow(monitor: Monitor) {
     setTriggeringId(monitor.id)
     try {
-      await fetch('/api/trigger', {
+      const res = await fetch('/api/trigger', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ monitorId: monitor.id }),
       })
+      const data = await res.json()
+      if (!res.ok) console.error('Trigger error:', data)
     } catch (e) {
-      console.error(e)
+      console.error('Trigger failed:', e)
     }
-    await fetchMonitors()
+    await fetchMonitors(true)
     setTriggeringId(null)
   }
 
@@ -79,6 +104,19 @@ export default function MonitorsPage() {
       <header className="topbar">
         <h2 className="topbar-title">Monitors</h2>
         <div className="topbar-actions">
+          {lastRefreshed && (
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              Updated {format(lastRefreshed, 'HH:mm:ss')}
+            </span>
+          )}
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={() => fetchMonitors()}
+            title="Refresh now"
+            id="refresh-monitors-btn"
+          >
+            <RefreshCw size={13} />
+          </button>
           <button
             className="btn btn-primary"
             onClick={() => { setEditMonitor(null); setShowModal(true) }}
@@ -100,8 +138,8 @@ export default function MonitorsPage() {
               <div className="empty-icon"><Radio size={28} color="var(--text-muted)" /></div>
               <p className="empty-title">No monitors yet</p>
               <p className="empty-description">
-                Create your first API trigger monitor. It will ping your endpoint at the scheduled interval,
-                keeping APIs warm and out of cool-down.
+                Create your first API trigger monitor. It will ping your endpoint at the
+                scheduled interval, keeping APIs warm and out of cool-down.
               </p>
               <button
                 className="btn btn-primary"
@@ -151,7 +189,7 @@ export default function MonitorsPage() {
                     </span>
                   </div>
                   <div className="meta-item">
-                    <span className="meta-label">Next run</span>
+                    <span className="meta-label">Próximo em</span>
                     <span className="meta-value" style={{ fontSize: '0.75rem' }}>
                       {monitor.next_trigger_at
                         ? formatDistanceToNow(new Date(monitor.next_trigger_at), { addSuffix: true })
@@ -160,7 +198,7 @@ export default function MonitorsPage() {
                   </div>
                   {monitor.last_triggered_at && (
                     <div className="meta-item">
-                      <span className="meta-label">Last run</span>
+                      <span className="meta-label">Último</span>
                       <span className="meta-value" style={{ fontSize: '0.75rem' }}>
                         {format(new Date(monitor.last_triggered_at), 'HH:mm:ss')}
                       </span>
@@ -169,7 +207,6 @@ export default function MonitorsPage() {
                 </div>
 
                 <div className="monitor-actions">
-                  {/* Trigger now */}
                   <button
                     className="btn btn-secondary btn-sm"
                     onClick={() => handleTriggerNow(monitor)}
@@ -183,7 +220,6 @@ export default function MonitorsPage() {
                     Run
                   </button>
 
-                  {/* Toggle active/paused */}
                   <button
                     className={`btn btn-icon ${monitor.status === 'paused' ? 'btn-success' : 'btn-secondary'}`}
                     onClick={() => handleToggle(monitor)}
@@ -196,7 +232,6 @@ export default function MonitorsPage() {
                       : monitor.status === 'paused' ? <Play size={14} /> : <Pause size={14} />}
                   </button>
 
-                  {/* Edit */}
                   <button
                     className="btn btn-ghost btn-icon"
                     onClick={() => { setEditMonitor(monitor); setShowModal(true) }}
@@ -206,7 +241,6 @@ export default function MonitorsPage() {
                     <Edit2 size={14} />
                   </button>
 
-                  {/* Open URL */}
                   <a
                     href={monitor.url}
                     target="_blank"
@@ -217,7 +251,6 @@ export default function MonitorsPage() {
                     <ExternalLink size={14} />
                   </a>
 
-                  {/* Delete */}
                   <button
                     className="btn btn-danger btn-icon"
                     onClick={() => handleDelete(monitor.id)}

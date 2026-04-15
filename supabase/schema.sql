@@ -1,6 +1,8 @@
 -- =============================================================
 -- TriggerBot — Supabase Schema
 -- Run this in your Supabase SQL Editor
+--
+-- Methods supported: GET | HEAD | POST | PUT | PATCH | DELETE
 -- =============================================================
 
 -- Enable Row Level Security
@@ -11,7 +13,7 @@ CREATE TABLE IF NOT EXISTS public.monitors (
   name              TEXT NOT NULL,
   url               TEXT NOT NULL,
   method            TEXT NOT NULL DEFAULT 'GET'
-                      CHECK (method IN ('GET','POST','PUT','PATCH','DELETE')),
+                      CHECK (method IN ('GET','HEAD','POST','PUT','PATCH','DELETE')),
   headers           JSONB NOT NULL DEFAULT '{}',
   body              TEXT,
   interval_seconds  INTEGER NOT NULL DEFAULT 300,
@@ -91,3 +93,17 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER monitors_updated_at
   BEFORE UPDATE ON public.monitors
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+-- =============================================================
+-- MIGRATION — Run this if the table already exists
+-- (updates the CHECK constraint to include HEAD)
+-- =============================================================
+
+-- 1. Drop the old constraint (find its name first if different)
+ALTER TABLE public.monitors
+  DROP CONSTRAINT IF EXISTS monitors_method_check;
+
+-- 2. Add updated constraint
+ALTER TABLE public.monitors
+  ADD CONSTRAINT monitors_method_check
+    CHECK (method IN ('GET','HEAD','POST','PUT','PATCH','DELETE'));
